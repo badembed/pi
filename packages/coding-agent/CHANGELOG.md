@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Local corporate fork: require an explicit network policy and a macOS Node launcher for CLI and SDK sessions. Use an independent `.pi-corporate` profile and hash-approved extension bundles; unverified model transports fail closed. See [Corporate mode](docs/corporate-mode.md).
+
+### Changed
+
+- Local corporate fork: retain coding tools, local context recovery, ACP delegation and model cache warming while disabling third-party management traffic and remote session/report uploads. Enforce process-tree egress through an origin-restricted broker and block external resource loading in HTML exports.
+
 ## [1.0.2] - 2026-10-04
 
 ### New Features

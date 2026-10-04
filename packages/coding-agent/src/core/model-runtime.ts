@@ -67,6 +67,8 @@ import {
 import { getAgentDir } from "../config.ts";
 import { operationSignal, raceWithAbortSignal } from "../utils/abort.ts";
 import { AuthStorage as DefaultAuthStorage } from "./auth-storage.ts";
+import { corporateFetch } from "./corporate-fetch.ts";
+import { type CorporateNetworkPolicy, loadCorporateNetworkPolicy } from "./corporate-network-policy.ts";
 import { ModelConfig } from "./model-config.ts";
 import { FileModelsStore, InMemoryCodingAgentModelsStore } from "./models-store.ts";
 import {
@@ -120,6 +122,8 @@ export interface CreateModelRuntimeOptions {
 	signal?: AbortSignal;
 	/** Skip initial catalog and availability refresh. Static models remain available. */
 	refreshOnCreate?: boolean;
+	/** Explicit policy for trusted SDK hosts. CLI reads the global network-policy.json. */
+	networkPolicy?: CorporateNetworkPolicy;
 }
 
 export interface ModelRuntimeAuthOverrides extends AuthOperationOptions {
@@ -180,6 +184,7 @@ export class ModelRuntime implements Models {
 	private readonly compositionErrors = new Map<string, string>();
 	private readonly modelsPath: string | undefined;
 	private readonly modelNetworkEnabled: boolean;
+	private readonly networkPolicy: CorporateNetworkPolicy;
 	private config: ModelConfig;
 	private snapshot: ModelRuntimeSnapshot = {
 		all: [],
@@ -201,11 +206,13 @@ export class ModelRuntime implements Models {
 		modelsStore: ModelsStore,
 		providers: readonly Provider[],
 		modelNetworkEnabled: boolean,
+		networkPolicy: CorporateNetworkPolicy,
 	) {
 		this.credentials = credentials;
 		this.config = config;
 		this.modelsPath = modelsPath;
 		this.modelNetworkEnabled = modelNetworkEnabled;
+		this.networkPolicy = networkPolicy;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
@@ -217,6 +224,7 @@ export class ModelRuntime implements Models {
 		const modelsPath =
 			options.modelsPath === null ? undefined : (options.modelsPath ?? join(getAgentDir(), "models.json"));
 		const config = await ModelConfig.load(modelsPath);
+		if (config.getError()) throw new Error(config.getError());
 		const modelsStore =
 			options.modelsStore ??
 			(modelsPath
@@ -225,6 +233,7 @@ export class ModelRuntime implements Models {
 		const builtinModelDataGeneratedAt = builtinProviderCatalog.getBuiltinModelDataGeneratedAt();
 		const providers = builtinProviderCatalog
 			.builtinProviders()
+			.filter((provider) => provider.id !== "radius")
 			.map((provider) =>
 				provider.id === "radius"
 					? provider
@@ -237,6 +246,7 @@ export class ModelRuntime implements Models {
 			modelsStore,
 			providers,
 			process.env.PI_OFFLINE === undefined,
+			options.networkPolicy ?? loadCorporateNetworkPolicy(),
 		);
 		runtime.configureRadiusProviders();
 		runtime.rebuildProviders();
@@ -263,16 +273,9 @@ export class ModelRuntime implements Models {
 		this.builtins.clear();
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		for (const providerId of this.config.getProviderIds()) {
-			const config = this.config.getProvider(providerId);
-			if (config?.oauth !== "radius" || !config.baseUrl) continue;
-			this.builtins.set(
-				providerId,
-				builtinProviderCatalog.radiusProvider({
-					id: providerId,
-					name: config.name ?? providerId,
-					gateway: config.baseUrl.replace(/\/v1\/?$/u, ""),
-				}),
-			);
+			if (this.config.getProvider(providerId)?.oauth === "radius") {
+				throw new Error("Radius gateway authentication is disabled in corporate Pi.");
+			}
 		}
 	}
 
@@ -288,12 +291,24 @@ export class ModelRuntime implements Models {
 
 	/** Returns the provider without virtual models, or undefined when only virtual models define it. */
 	private recomposeProvider(providerId: string): Provider | undefined {
-		const provider = this.composeProvider(providerId);
+		const composed = this.composeProvider(providerId);
+		const provider = composed && this.restrictProvider(composed);
 		const virtualModels = [...(this.virtualModels.get(providerId)?.values() ?? [])].map((entry) => entry.model);
 		if (virtualModels.length > 0) this.models.setProvider(withVirtualModels(providerId, provider, virtualModels));
 		else if (provider) this.models.setProvider(provider);
 		else this.models.deleteProvider(providerId);
 		return provider;
+	}
+
+	private restrictProvider(provider: Provider): Provider | undefined {
+		const allowed = (model: AnyModel) => this.networkPolicy.allowsModel(model.provider, model.baseUrl);
+		const getAllModels = () => (provider.getAllModels?.() ?? provider.getModels()).filter(allowed);
+		if (getAllModels().length === 0) return undefined;
+		return {
+			...provider,
+			getModels: () => provider.getModels().filter(allowed),
+			getAllModels,
+		};
 	}
 
 	/** The provider without virtual models, or undefined when nothing defines it. */
@@ -311,7 +326,7 @@ export class ModelRuntime implements Models {
 			return provider;
 		} catch (error) {
 			this.compositionErrors.set(providerId, error instanceof Error ? error.message : String(error));
-			return base;
+			throw error;
 		}
 	}
 
@@ -551,6 +566,7 @@ export class ModelRuntime implements Models {
 		overrides: ModelRuntimeAuthOverrides = {},
 	): Promise<AuthResult | undefined> {
 		if (typeof providerOrModel === "string") return this.models.getAuth(providerOrModel, overrides);
+		this.networkPolicy.assertModel(providerOrModel.provider, providerOrModel.baseUrl);
 		const resolution = await this.models.getAuth(providerOrModel, overrides);
 		if (!resolution) return undefined;
 		const configuredHeaders = resolveConfiguredModelHeaders(
@@ -676,11 +692,20 @@ export class ModelRuntime implements Models {
 				? { ...(resolution.env ?? {}), ...(providerOptions.env ?? {}) }
 				: undefined;
 		const requestModel: TModel = resolution.auth.baseUrl ? { ...model, baseUrl: resolution.auth.baseUrl } : model;
+		this.networkPolicy.assertModel(requestModel.provider, requestModel.baseUrl);
+		if (
+			!["openai-completions", "openai-responses", "anthropic-messages", "azure-openai-responses"].includes(
+				requestModel.api,
+			)
+		) {
+			throw new Error(`Corporate transport has not been verified for API ${requestModel.api}.`);
+		}
 		return {
 			provider,
 			model: requestModel,
 			options: {
 				...providerOptions,
+				fetch: corporateFetch(this.networkPolicy, providerOptions.fetch ?? globalThis.fetch, requestModel.provider),
 				apiKey: providerOptions.apiKey ?? resolution.auth.apiKey,
 				headers,
 				env,
@@ -838,6 +863,7 @@ export class ModelRuntime implements Models {
 
 	async refresh(options: ModelsRefreshOptions = {}): Promise<ModelsRefreshResult> {
 		this.config = await ModelConfig.load(this.modelsPath);
+		if (this.config.getError()) throw new Error(this.config.getError());
 		this.configureRadiusProviders();
 		if (options.providers) {
 			for (const providerId of new Set(options.providers)) this.recomposeProvider(providerId);

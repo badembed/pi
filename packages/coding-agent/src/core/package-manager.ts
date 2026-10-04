@@ -52,9 +52,7 @@ const UPDATE_CHECK_CONCURRENCY = 4;
 const GIT_UPDATE_CONCURRENCY = 4;
 
 function isOfflineModeEnabled(): boolean {
-	const value = process.env.PI_OFFLINE;
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+	return true;
 }
 
 function isExactNpmVersion(version: string | undefined): boolean {
@@ -1814,6 +1812,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async runNpmCommand(args: string[], options?: { cwd?: string }): Promise<void> {
+		if (isOfflineModeEnabled()) throw new Error("Corporate Pi does not run package installation or update commands.");
 		const npmCommand = this.getNpmCommand();
 		await this.runCommand(npmCommand.command, [...npmCommand.args, ...args], options);
 	}
@@ -1889,6 +1888,8 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private async installGit(source: GitSource, scope: SourceScope): Promise<void> {
+		if (isOfflineModeEnabled())
+			throw new Error("Corporate Pi loads reviewed local extensions; Git installation is disabled.");
 		const targetDir = this.getGitInstallPath(source, scope);
 		if (existsSync(targetDir)) {
 			if (source.ref) {
@@ -2135,6 +2136,7 @@ export class DefaultPackageManager implements PackageManager {
 	}
 
 	private getLegacyGlobalNpmInstallPath(source: NpmSource): string | undefined {
+		if (isOfflineModeEnabled()) return undefined;
 		try {
 			return this.getPnpmGlobalPackagePath(source.name) ?? join(this.getGlobalNpmRoot(), source.name);
 		} catch {

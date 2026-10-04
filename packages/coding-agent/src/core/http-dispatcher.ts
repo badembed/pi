@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import * as undici from "undici";
+import { loadCorporateNetworkPolicy } from "./corporate-network-policy.ts";
 
 export const DEFAULT_HTTP_IDLE_TIMEOUT_MS = 300_000;
 // Node's 250ms default can terminate valid connection attempts on high-latency routes.
@@ -97,7 +98,14 @@ export function configureHttpDispatcher(timeoutMs: number = DEFAULT_HTTP_IDLE_TI
 			factory: createUndiciOriginDispatcher,
 		}),
 	);
-	undici.setGlobalDispatcher(dispatcher);
+	const policy = loadCorporateNetworkPolicy();
+	undici.setGlobalDispatcher(
+		dispatcher.compose((dispatch) => (options, handler) => {
+			if (!options.origin) throw new Error("Corporate policy requires an explicit network origin.");
+			policy.assertNetwork(new URL(options.path, options.origin).href);
+			return dispatch(options, handler);
+		}),
+	);
 	// Keep fetch and the dispatcher on the same undici implementation. Node 26.0's
 	// bundled fetch can otherwise consume compressed responses through npm undici's
 	// dispatcher without decompressing them, causing response.json() failures.

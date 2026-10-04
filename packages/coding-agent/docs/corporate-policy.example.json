@@ -1,0 +1,9 @@
+{
+	"providers": {
+		"corporate": {
+			"modelOrigins": ["https://llm.company.example"],
+			"authOrigins": []
+		}
+	},
+	"extensions": []
+}
