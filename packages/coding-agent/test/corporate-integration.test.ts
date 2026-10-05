@@ -189,7 +189,7 @@ async function fixture(withExtension = false, redirect = false, tls = false) {
 	return { directory, cwd, agentDir, requests };
 }
 
-describe.skipIf(process.platform !== "darwin" || !existsSync(cli))("built corporate Pi", () => {
+describe.skipIf(!["darwin", "linux"].includes(process.platform) || !existsSync(cli))("built corporate Pi", () => {
 	it("streams through the native launcher in print and RPC modes", async () => {
 		const { cwd, agentDir, requests } = await fixture();
 		const printed = await run(cli, ["-p", "--no-session", "SYNTHETIC_MAIN"], cwd, agentDir);

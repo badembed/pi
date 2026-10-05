@@ -4,7 +4,7 @@
 
 ### Breaking Changes
 
-- Local corporate fork: require an explicit network policy and a macOS Node launcher for CLI and SDK sessions. Use an independent `.pi-corporate` profile and hash-approved extension bundles; unverified model transports fail closed. See [Corporate mode](docs/corporate-mode.md).
+- Local corporate fork: require an explicit network policy and a native Node launcher for CLI and SDK sessions on macOS or Linux. Use an independent `.pi-corporate` profile and hash-approved extension bundles; unverified model transports fail closed. See [Corporate mode](docs/corporate-mode.md).
 
 ### Changed
 

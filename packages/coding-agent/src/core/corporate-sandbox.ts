@@ -1,6 +1,15 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { createServer, request as httpRequest, type IncomingHttpHeaders } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { connect, type Socket } from "node:net";
@@ -9,25 +18,26 @@ import { dirname, join, resolve } from "node:path";
 import { getAgentDir, getPackageDir } from "../config.ts";
 import { CorporateNetworkPolicy } from "./corporate-network-policy.ts";
 
+function canonicalSandboxPath(path: string): string {
+	let parent = resolve(path);
+	const suffix: string[] = [];
+	for (;;) {
+		try {
+			return join(realpathSync(parent), ...suffix);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+			const next = dirname(parent);
+			if (next === parent) throw error;
+			suffix.unshift(parent.slice(next.length + (next === "/" ? 0 : 1)));
+			parent = next;
+		}
+	}
+}
+
 export function corporateSandboxProfile(proxyPort: number, writable: string[], protectedPaths: string[]): string {
 	if (!Number.isInteger(proxyPort) || proxyPort <= 0 || proxyPort > 65535) throw new Error("Invalid proxy port.");
-	const canonical = (path: string): string => {
-		let parent = resolve(path);
-		const suffix: string[] = [];
-		for (;;) {
-			try {
-				return join(realpathSync(parent), ...suffix);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-				const next = dirname(parent);
-				if (next === parent) throw error;
-				suffix.unshift(parent.slice(next.length + (next === "/" ? 0 : 1)));
-				parent = next;
-			}
-		}
-	};
-	writable = writable.map(canonical);
-	protectedPaths = protectedPaths.map(canonical);
+	writable = writable.map(canonicalSandboxPath);
+	protectedPaths = protectedPaths.map(canonicalSandboxPath);
 	const pathRule = (path: string) => `(subpath ${JSON.stringify(path)})`;
 	return [
 		"(version 1)",
@@ -52,8 +62,64 @@ export function corporateSandboxProfile(proxyPort: number, writable: string[], p
 	].join("\n");
 }
 
+/** Rootless namespaces provide the network boundary; the helper installs seccomp before exec. */
+export function corporateLinuxSandboxArgs(writable: string[], protectedPaths: string[], launchDir: string): string[] {
+	writable = writable.map(canonicalSandboxPath);
+	const args = [
+		"--unshare-user",
+		"--unshare-net",
+		"--unshare-pid",
+		"--unshare-ipc",
+		"--unshare-uts",
+		"--disable-userns",
+		"--cap-drop",
+		"ALL",
+		"--die-with-parent",
+		"--new-session",
+		"--ro-bind",
+		"/",
+		"/",
+		"--tmpfs",
+		"/run",
+		"--tmpfs",
+		"/tmp",
+		"--proc",
+		"/proc",
+		"--remount-ro",
+		"/proc",
+		"--dev",
+		"/dev",
+	];
+	for (const path of writable) {
+		if (path === "/") throw new Error("The corporate writable directory cannot be the filesystem root.");
+		args.push("--bind", path, path);
+	}
+	const emptyDirectory = join(launchDir, "empty-directory");
+	const emptyFile = join(launchDir, "empty-file");
+	const emptyJson = join(launchDir, "empty.json");
+	mkdirSync(emptyDirectory, { mode: 0o700 });
+	writeFileSync(emptyFile, "", { mode: 0o600 });
+	writeFileSync(emptyJson, "{}", { mode: 0o600 });
+	for (const path of [...new Set(protectedPaths.map(canonicalSandboxPath))].sort((a, b) => a.length - b.length)) {
+		let source = path;
+		if (!existsSync(path)) {
+			// An absent path outside the writable mounts is already protected by
+			// the read-only root. Creating its mountpoint there would fail startup.
+			if (!writable.some((directory) => path === directory || path.startsWith(`${directory}/`))) continue;
+			source = path.endsWith(".json")
+				? emptyJson
+				: /\.(?:gitconfig|zshrc|bashrc)$/.test(path)
+					? emptyFile
+					: emptyDirectory;
+		}
+		args.push("--ro-bind", source, path);
+	}
+	args.push("--chdir", realpathSync(process.cwd()));
+	return args;
+}
+
 /** The broker runs outside the sandbox; children can reach only its loopback port. */
-export async function startCorporateProxy(policy: CorporateNetworkPolicy) {
+export async function startCorporateProxy(policy: CorporateNetworkPolicy, socketPath?: string) {
 	const sockets = new Set<Socket>();
 	const server = createServer((req, res) => {
 		let target: URL;
@@ -126,12 +192,13 @@ export async function startCorporateProxy(policy: CorporateNetworkPolicy) {
 	});
 	await new Promise<void>((done, reject) => {
 		server.once("error", reject);
-		server.listen(0, "127.0.0.1", done);
+		if (socketPath) server.listen(socketPath, done);
+		else server.listen(0, "127.0.0.1", done);
 	});
 	const address = server.address();
-	if (!address || typeof address === "string") throw new Error("Corporate proxy failed to start.");
+	if (!address) throw new Error("Corporate proxy failed to start.");
 	return {
-		port: address.port,
+		port: typeof address === "string" ? 31987 : address.port,
 		close: async () => {
 			for (const socket of sockets) socket.destroy();
 			await new Promise<void>((done) => server.close(() => done()));
@@ -140,8 +207,24 @@ export async function startCorporateProxy(policy: CorporateNetworkPolicy) {
 }
 
 async function verifyNativeSandbox(): Promise<void> {
+	if (process.platform === "linux") {
+		const status = readFileSync("/proc/self/status", "utf8");
+		const routes = readFileSync("/proc/net/route", "utf8").trim().split("\n").slice(1);
+		const ipv6Routes = readFileSync("/proc/net/ipv6_route", "utf8").trim().split("\n").filter(Boolean);
+		if (
+			!/^NoNewPrivs:\s+1$/m.test(status) ||
+			!/^Seccomp:\s+2$/m.test(status) ||
+			!/^CapEff:\s+0+$/m.test(status) ||
+			routes.length ||
+			ipv6Routes.some((line) => line.trim().split(/\s+/).at(-1) !== "lo")
+		)
+			throw new Error("Corporate sandbox is not active.");
+	}
 	await new Promise<void>((done, reject) => {
-		const socket = connect(9, "127.0.0.1");
+		const socket =
+			process.platform === "linux"
+				? connect({ path: "/tmp/pi-native-isolation-probe.sock" })
+				: connect(9, "127.0.0.1");
 		socket.setTimeout(2000, () => {
 			socket.destroy();
 			reject(new Error("Cannot verify native network isolation."));
@@ -178,7 +261,17 @@ export async function launchCorporateProcess(
 ): Promise<void> {
 	if (process.env.PI_CORPORATE_SANDBOX === "1")
 		throw new Error("A sandboxed process cannot start an unsandboxed broker.");
-	if (process.platform !== "darwin") throw new Error("Corporate process isolation currently requires macOS.");
+	if (process.platform !== "darwin" && process.platform !== "linux")
+		throw new Error("Corporate process isolation requires macOS or Linux.");
+	const linuxHelper = join(getPackageDir(), "dist/corporate-linux-helper");
+	if (process.platform === "linux") {
+		if (!existsSync(linuxHelper) || !existsSync("/usr/bin/bwrap"))
+			throw new Error(
+				"Corporate Linux isolation requires /usr/bin/bwrap and the source-built corporate-linux-helper. No unsandboxed fallback.",
+			);
+		if (statSync("/usr/bin/bwrap").mode & 0o6000)
+			throw new Error("Corporate Linux isolation requires non-setuid bubblewrap.");
+	}
 	process.umask(0o077);
 	const agentDir = resolve(getAgentDir());
 	mkdirSync(agentDir, { recursive: true, mode: 0o700 });
@@ -197,7 +290,10 @@ export async function launchCorporateProcess(
 	const scratch = mkdtempSync(join(realpathSync(tmpdir()), "pi-corporate-"));
 	const entry = realpathSync(options.entry ?? process.argv[1]);
 	const cli = realpathSync(options.cli ?? entry);
-	const broker = await startCorporateProxy(policy);
+	const bridgeDir = join(scratch, "bridge");
+	mkdirSync(bridgeDir, { mode: 0o700 });
+	const socketPath = process.platform === "linux" ? join(bridgeDir, "broker.sock") : undefined;
+	const broker = await startCorporateProxy(policy, socketPath);
 	try {
 		const proxy = `http://127.0.0.1:${broker.port}`;
 		const env = { ...process.env };
@@ -241,6 +337,7 @@ export async function launchCorporateProcess(
 			if (existsSync(modules)) dependencyPaths.push(modules);
 		}
 		const protectedPaths = [
+			bridgeDir,
 			launchDir,
 			policyPath,
 			packageDir,
@@ -263,17 +360,25 @@ export async function launchCorporateProcess(
 			join(homedir(), ".bashrc"),
 			...policy.getExtensionPaths(),
 		];
-		writeFileSync(
-			profilePath,
-			corporateSandboxProfile(broker.port, [realpathSync(process.cwd()), agentDir, scratch], protectedPaths),
-			{ mode: 0o600 },
-		);
+		const writable = [realpathSync(process.cwd()), agentDir, scratch];
+		const command = process.platform === "linux" ? "/usr/bin/bwrap" : "/usr/bin/sandbox-exec";
+		let args: string[];
+		if (socketPath) {
+			args = [
+				...corporateLinuxSandboxArgs(writable, protectedPaths, launchDir),
+				linuxHelper,
+				socketPath,
+				String(broker.port),
+				process.execPath,
+				entry,
+				...(options.args ?? process.argv.slice(2)),
+			];
+		} else {
+			writeFileSync(profilePath, corporateSandboxProfile(broker.port, writable, protectedPaths), { mode: 0o600 });
+			args = ["-f", profilePath, process.execPath, entry, ...(options.args ?? process.argv.slice(2))];
+		}
 		chmodSync(launchDir, 0o700);
-		const child = spawn(
-			"/usr/bin/sandbox-exec",
-			["-f", profilePath, process.execPath, entry, ...(options.args ?? process.argv.slice(2))],
-			{ env, stdio: "inherit" },
-		);
+		const child = spawn(command, args, { env, stdio: "inherit" });
 		// Keep the broker alive while the child handles interruption. A raw TUI
 		// handles Ctrl+C itself; print-mode foreground processes can both receive it.
 		const signals = ["SIGINT", "SIGTERM", "SIGHUP"] as const;

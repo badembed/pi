@@ -17,6 +17,7 @@ Allow conversations, tools, cache warming, summaries and ACP delegation to expli
 - [x] Enforce transport origins and redirects; verify each supported SDK transport.
 - [x] Patch local billion-context-pi: disable updater, bind delegate CLI/profile, preserve compression, search, replay and cache.
 - [x] Enforce macOS process-tree network isolation; reject sandbox startup errors and inherited bypasses.
+- [x] Add rootless Linux namespaces, a mandatory native seccomp launcher and a private broker bridge; verify descendants and fail-closed startup on native Linux.
 - [x] Protect local files, environment and diagnostics; prevent browser export network loads.
 - [x] Run targeted synthetic security/compatibility tests and the full required static check.
 - [x] Build offline; verify CLI, print, RPC, SDK, model transport, ACP and child processes.
@@ -46,4 +47,15 @@ Verification:
 
 Setup, supported APIs, local storage, SDK launch and limitations: [corporate-mode.md](packages/coding-agent/docs/corporate-mode.md).
 
-Remaining acceptance work requires the real corporate URL/API and the user's locally supplied credentials/CA: verify model IDs, TLS/auth, proxy requirements and actual egress before switching installation. Unsupported transports, other OSes and Bun/binary builds have no claimed coverage. Configured endpoints are trusted recipients; their own routing/logging/storage is outside this local policy.
+## Linux verification — 2026-10-05
+
+- Built in a separate Debian 12 ARM64 container on Docker Desktop's real Linux 6.10.14 kernel, using Node 22.19.0 and non-setuid bubblewrap 0.8.0. No host files, Docker socket, API credentials or existing user containers were exposed to the tests.
+- Dependencies used `npm ci --ignore-scripts`; no dependency versions or lockfiles changed. Full offline workspace build and required `npm run check` passed on Linux. The updated macOS build/check also passed.
+- Linux: 38 targeted tests passed in seven files; the macOS native test and intentionally unavailable-host test were skipped in that run. A separate run inside a user namespace with further user namespaces disabled passed the unavailable-host test: Pi exited, with zero requests to the synthetic model. Thus 39 distinct tests passed on Linux across the two runs. macOS regression: 37 tests passed, with the three Linux cases skipped.
+- Native tests exercise an outer container that has networking: approved broker traffic works, direct Node/curl connections cannot reach servers in the outer namespace, and an unapproved collector receives zero requests. UDP/raw/netlink/named Unix sockets and datagram/seqpacket socketpairs return EPERM. Anonymous stream pairs remain usable for Node subprocess pipes and cannot reconnect/listen on a named host socket. New user namespaces are refused. Protected writes/new hard links fail; local coding writes work. A 200 KB response traverses the bridge intact.
+- Built CLI, RPC, SDK write/read/bash, HTTPS trust/rejection, redirects and real ACP delegation all passed under Linux namespaces/seccomp. The existing transport/policy/cache-warmer tests also passed. The ACP extension remained the already approved patched single-file bundle; no plugin source change was required for Linux.
+- Interactive Pi received a synthetic model reply and exited normally in a native Linux PTY (one model request).
+- Docker's existing default seccomp setting was unconfined. Only the temporary test container used explicit `seccomp=unconfined` and `systempaths=unconfined` to permit nested sandbox setup, with no privileges, all outer capabilities dropped and no-new-privileges enabled. The Pi process then installed its own mandatory filter (Seccomp=2), disabled user namespaces and dropped capabilities. Global Docker settings were not changed. See `test/fixtures/corporate-linux.Dockerfile` for the setup image.
+- JSON reports and PTY evidence are retained locally with the task outputs; only source, tests and documentation are published to the fork.
+
+Remaining acceptance work requires the real corporate URL/API and the user's locally supplied credentials/CA: verify model IDs, TLS/auth, proxy requirements and actual egress before switching installation. Native Linux x86-64 and the exact target server configuration have not been tested; the helper supports x86-64 builds but that is not a native integration result. Unsupported transports, Windows and Bun/binary builds have no claimed coverage. Configured endpoints are trusted recipients; their own routing/logging/storage is outside this local policy.
